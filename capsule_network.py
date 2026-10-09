@@ -1,5 +1,6 @@
 
 import math
+import random
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 
 SEED = 42
@@ -19,6 +20,7 @@ IMAGE_SIZE = 28
 BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 0.001
+TEST_IMAGES = 300
 
 CLASS_NAMES = ["Círculo", "Triângulo", "Quadrado"]
 
@@ -74,6 +76,36 @@ class GeometricShapesDataset(Dataset):
         label = torch.tensor(label, dtype=torch.long)
 
         return image, label
+
+
+def create_balanced_subset(dataset, total_samples, seed=SEED):
+    num_classes = len(dataset.CLASS_TO_LABEL)
+    if total_samples % num_classes != 0:
+        raise ValueError(
+            "O total de amostras deve ser divisível pelo número de classes."
+        )
+
+    samples_per_class = total_samples // num_classes
+    rng = random.Random(seed)
+    selected_indices = []
+
+    for label in dataset.CLASS_TO_LABEL.values():
+        class_indices = [
+            index
+            for index, (_, sample_label) in enumerate(dataset.samples)
+            if sample_label == label
+        ]
+        if len(class_indices) < samples_per_class:
+            raise ValueError(
+                f"A classe {label} não possui amostras suficientes."
+            )
+
+        selected_indices.extend(
+            rng.sample(class_indices, samples_per_class)
+        )
+
+    rng.shuffle(selected_indices)
+    return Subset(dataset, selected_indices)
 
 
 def squash(vectors, dim=-1):
@@ -303,6 +335,11 @@ def organize_test_predictions(model, dataset, loader, output_dir):
         (output_dir / class_name).mkdir(parents=True, exist_ok=True)
 
     counts = {class_name: 0 for class_name in label_to_folder.values()}
+    sample_indices = getattr(
+        loader.dataset,
+        "indices",
+        range(len(dataset))
+    )
     sample_index = 0
     model.eval()
 
@@ -312,7 +349,9 @@ def organize_test_predictions(model, dataset, loader, output_dir):
             predictions = scores.argmax(dim=1).cpu().tolist()
 
             for predicted_label in predictions:
-                source_path, _ = dataset.samples[sample_index]
+                source_path, _ = dataset.samples[
+                    sample_indices[sample_index]
+                ]
                 class_name = label_to_folder[predicted_label]
                 shutil.copy2(
                     source_path,
@@ -331,6 +370,10 @@ def train():
     data_dir = Path(__file__).resolve().parent
     train_dataset = GeometricShapesDataset(data_dir / "train")
     test_dataset = GeometricShapesDataset(data_dir / "test")
+    test_subset = create_balanced_subset(
+        test_dataset,
+        TEST_IMAGES
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -339,7 +382,7 @@ def train():
     )
 
     test_loader = DataLoader(
-        test_dataset,
+        test_subset,
         batch_size=BATCH_SIZE,
         shuffle=False
     )
@@ -353,7 +396,7 @@ def train():
 
     print(f"Imagens de treinamento: {len(train_dataset)}")
     print("-" * 40)
-    print(f"Imagens de teste: {len(test_dataset)}")
+    print(f"Imagens de teste: {len(test_subset)}")
     print("-" * 40)
 
     for epoch in range(EPOCHS):
@@ -417,7 +460,7 @@ def predict(model, image, true_label=None):
         predicted_class = scores.argmax(dim=1).item()
 
     print("\nResultado da classificação")
-    print("---------------------------")
+    print("-" * 40)
     print(f"Classe prevista: {CLASS_NAMES[predicted_class]}")
     print("-" * 40)
     print(
@@ -441,8 +484,9 @@ def predict(model, image, true_label=None):
 if __name__ == "__main__":
     model, test_loader = train()
 
-    # Testa uma imagem do conjunto de teste.
-    image, label = next(iter(test_loader))
+    rng = random.Random(SEED + 1)
+    sample_index = rng.randrange(len(test_loader.dataset))
+    image, label = test_loader.dataset[sample_index]
 
     predict(
         model,
