@@ -21,6 +21,11 @@ BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 0.001
 TEST_IMAGES = 300
+DATASET_DIR = Path(
+    "/content/drive/MyDrive/Software Engineering/6ºP/Redes Neurais"
+)
+TRAIN_DIR = DATASET_DIR / "train"
+TEST_DIR = DATASET_DIR / "test"
 
 CLASS_NAMES = ["Círculo", "Triângulo", "Quadrado"]
 
@@ -367,9 +372,14 @@ def organize_test_predictions(model, dataset, loader, output_dir):
 
 
 def train():
-    data_dir = Path(__file__).resolve().parent
-    train_dataset = GeometricShapesDataset(data_dir / "train")
-    test_dataset = GeometricShapesDataset(data_dir / "test")
+    if not TRAIN_DIR.is_dir() or not TEST_DIR.is_dir():
+        raise FileNotFoundError(
+            "Não encontrei as pastas train/test no Google Drive. "
+            "Monte o Drive no Colab e confira DATASET_DIR."
+        )
+
+    train_dataset = GeometricShapesDataset(TRAIN_DIR)
+    test_dataset = GeometricShapesDataset(TEST_DIR)
     test_subset = create_balanced_subset(
         test_dataset,
         TEST_IMAGES
@@ -442,7 +452,7 @@ def train():
         model,
         test_dataset,
         test_loader,
-        data_dir / "resultados_teste"
+        DATASET_DIR / "resultados_teste"
     )
 
     return model, test_loader
