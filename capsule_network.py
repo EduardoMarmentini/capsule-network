@@ -23,6 +23,7 @@ BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 0.001
 TEST_IMAGES = 1500
+CAPSULE_LAYOUT_VERSION = 2
 
 DATASET_DIR = Path(
     "/content/drive/MyDrive/Software Engineering/6ºP/Redes Neurais"
@@ -82,13 +83,7 @@ class GeometricShapesDataset(Dataset):
         image_path, label = self.samples[index]
 
         with Image.open(image_path) as source:
-            image = source.convert("L").resize(
-                (IMAGE_SIZE, IMAGE_SIZE),
-                resample=Image.Resampling.BILINEAR
-            )
-
-        image = np.asarray(image, dtype=np.float32) / 255.0
-        image = torch.from_numpy(image).unsqueeze(0)
+            image = preprocess_image(source)
         label = torch.tensor(label, dtype=torch.long)
 
         return image, label
@@ -146,6 +141,7 @@ def squash(vectors, dim=-1):
 class PrimaryCapsules(nn.Module):
     def __init__(self, in_channels=256, capsule_channels=32, capsule_dim=8):
         super().__init__()
+        self.capsule_channels = capsule_channels
         self.capsule_dim = capsule_dim
         self.conv = nn.Conv2d(
             in_channels,
@@ -156,8 +152,16 @@ class PrimaryCapsules(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        batch_size = x.size(0)
-        x = x.view(batch_size, self.capsule_dim, -1).transpose(1, 2)
+        batch_size, _, height, width = x.shape
+        x = x.view(
+            batch_size,
+            self.capsule_channels,
+            self.capsule_dim,
+            height,
+            width
+        )
+        x = x.permute(0, 3, 4, 1, 2).contiguous()
+        x = x.view(batch_size, -1, self.capsule_dim)
         return squash(x)
 
 
@@ -282,6 +286,7 @@ def save_checkpoint(model, optimizer, epoch, path):
             "seed": SEED,
             "class_to_label": CLASS_TO_LABEL,
             "image_size": IMAGE_SIZE,
+            "capsule_layout_version": CAPSULE_LAYOUT_VERSION,
         },
         path
     )
@@ -355,6 +360,107 @@ def predict(model, image, true_label=None):
         print(f"Classe real: {CLASS_NAMES[int(true_label)]}")
 
     return predicted_class
+
+
+def preprocess_image(source):
+    """Converte uma imagem PIL para o formato usado pelo modelo."""
+    image = source.convert("L").resize(
+        (IMAGE_SIZE, IMAGE_SIZE),
+        resample=Image.Resampling.BILINEAR
+    )
+    image = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(image).unsqueeze(0)
+
+
+def load_model(checkpoint_path=None):
+    """Carrega o melhor modelo salvo para classificar imagens."""
+    if checkpoint_path is None:
+        checkpoint_path = CHECKPOINT_DIR / "capsule_network_best.pth"
+    checkpoint_path = Path(checkpoint_path)
+
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint não encontrado: {checkpoint_path}. "
+            "Treine o modelo antes ou informe o caminho correto."
+        )
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError(f"Checkpoint inválido: {checkpoint_path}")
+    if checkpoint.get("capsule_layout_version") != CAPSULE_LAYOUT_VERSION:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint incompatível: {checkpoint_path}. "
+            "O formato das cápsulas mudou; é necessário treinar novamente."
+        )
+
+    model = CapsuleNetwork().to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model
+
+
+class CheckpointCompatibilityError(ValueError):
+    """Indica que checkpoint usa uma versão incompatível da arquitetura."""
+
+
+def predict_image_file(model, image_path):
+    """Classifica uma imagem de arquivo e mostra a forma prevista."""
+    with Image.open(image_path) as source:
+        image = preprocess_image(source)
+    return predict(model, image)
+
+
+def upload_and_predict(model=None):
+    """Carrega ou treina o modelo e classifica imagens do Google Colab."""
+    if model is None:
+        checkpoint_path = CHECKPOINT_DIR / "capsule_network_best.pth"
+        print(f"Procurando checkpoint em: {checkpoint_path}")
+        if checkpoint_path.is_file():
+            print("Checkpoint encontrado. Iniciando carregamento...")
+            try:
+                model = load_model(checkpoint_path)
+            except CheckpointCompatibilityError as error:
+                print(f"{error} Treinando novamente...")
+                model, _, _ = train()
+            else:
+                print("Checkpoint carregado com sucesso.")
+        else:
+            available_checkpoints = sorted(
+                path.name for path in CHECKPOINT_DIR.glob("*.pth")
+            )
+            print(f"Checkpoint esperado não encontrado: {checkpoint_path}")
+            print(
+                "Outros arquivos .pth encontrados: "
+                f"{available_checkpoints or 'nenhum'}"
+            )
+            print("Iniciando treinamento porque o checkpoint esperado falta.")
+            model, _, _ = train()
+            print("Treinamento concluído.")
+    else:
+        print(
+            "Modelo recebido como argumento. Não vou procurar checkpoint "
+            "nem iniciar treinamento."
+        )
+
+    from google.colab import files
+
+    results = {}
+    while True:
+        print("\nSelecione uma ou mais imagens para classificar.")
+        uploaded_files = files.upload()
+        if not uploaded_files:
+            print("Nenhuma imagem enviada. Encerrando os testes.")
+            break
+
+        for filename in uploaded_files:
+            predicted_class = predict_image_file(model, filename)
+            results[filename] = CLASS_NAMES[predicted_class]
+
+        repeat = input("\nDeseja enviar mais imagens? (s/n): ").strip().lower()
+        if repeat not in {"s", "sim"}:
+            break
+
+    return results
 
 
 # ============================================================
@@ -537,12 +643,4 @@ def train():
 # ============================================================
 
 if __name__ == "__main__":
-    model, test_loader, test_dataset = train()
-
-    rng = random.Random(SEED + 1)
-    sample_index = rng.randrange(len(test_loader.dataset))
-    image, label = test_loader.dataset[sample_index]
-
-    print("\nPredição de uma imagem do conjunto de teste")
-    print("-" * 50)
-    predict(model, image, true_label=label.item())
+    upload_and_predict()
