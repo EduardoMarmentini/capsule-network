@@ -1,4 +1,3 @@
-
 import math
 import random
 import shutil
@@ -9,10 +8,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, Subset
 
+
+# ============================================================
+# 1. CONFIGURAÇÃO
+# ============================================================
 
 SEED = 42
 NUM_CLASSES = 3
@@ -20,40 +22,47 @@ IMAGE_SIZE = 28
 BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 0.001
-TEST_IMAGES = 300
+TEST_IMAGES = 1500
+
 DATASET_DIR = Path(
     "/content/drive/MyDrive/Software Engineering/6ºP/Redes Neurais"
 )
 TRAIN_DIR = DATASET_DIR / "train"
 TEST_DIR = DATASET_DIR / "test"
+CHECKPOINT_DIR = DATASET_DIR / "checkpoints"
+RESULTS_DIR = DATASET_DIR / "resultados_teste"
 
 CLASS_NAMES = ["Círculo", "Triângulo", "Quadrado"]
+CLASS_TO_LABEL = {"circle": 0, "triangle": 1, "square": 2}
 
+random.seed(SEED)
+np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Dispositivo utilizado: {device}")
-print("-" * 40)
+print("-" * 50)
 
+
+# ============================================================
+# 2. DATASET E SELEÇÃO BALANCEADA
+# ============================================================
 
 class GeometricShapesDataset(Dataset):
     """Carrega imagens PNG organizadas em pastas por classe."""
 
-    CLASS_TO_LABEL = {
-        "circle": 0,
-        "triangle": 1,
-        "square": 2,
-    }
+    CLASS_TO_LABEL = CLASS_TO_LABEL
 
     def __init__(self, root_dir):
+        self.root_dir = Path(root_dir)
         self.samples = []
 
         for class_name, label in self.CLASS_TO_LABEL.items():
-            class_dir = Path(root_dir) / class_name
+            class_dir = self.root_dir / class_name
             image_paths = sorted(class_dir.glob("*.png"))
+
             if not image_paths:
                 raise FileNotFoundError(
                     f"Nenhuma imagem PNG encontrada em: {class_dir}"
@@ -62,6 +71,9 @@ class GeometricShapesDataset(Dataset):
             self.samples.extend(
                 (image_path, label) for image_path in image_paths
             )
+
+        if not self.samples:
+            raise ValueError(f"Nenhuma imagem encontrada em {self.root_dir}")
 
     def __len__(self):
         return len(self.samples)
@@ -75,34 +87,39 @@ class GeometricShapesDataset(Dataset):
                 resample=Image.Resampling.BILINEAR
             )
 
-        image = np.array(image, dtype=np.float32) / 255.0
+        image = np.asarray(image, dtype=np.float32) / 255.0
         image = torch.from_numpy(image).unsqueeze(0)
-
         label = torch.tensor(label, dtype=torch.long)
 
         return image, label
 
 
 def create_balanced_subset(dataset, total_samples, seed=SEED):
+    """Seleciona a mesma quantidade de imagens de cada classe."""
     num_classes = len(dataset.CLASS_TO_LABEL)
+
     if total_samples % num_classes != 0:
         raise ValueError(
-            "O total de amostras deve ser divisível pelo número de classes."
+            f"total_samples ({total_samples}) precisa ser divisível "
+            f"por num_classes ({num_classes})."
         )
 
     samples_per_class = total_samples // num_classes
     rng = random.Random(seed)
     selected_indices = []
 
-    for label in dataset.CLASS_TO_LABEL.values():
+    for class_name, label in dataset.CLASS_TO_LABEL.items():
         class_indices = [
             index
             for index, (_, sample_label) in enumerate(dataset.samples)
             if sample_label == label
         ]
+
         if len(class_indices) < samples_per_class:
             raise ValueError(
-                f"A classe {label} não possui amostras suficientes."
+                f"A classe '{class_name}' tem {len(class_indices)} imagens; "
+                f"são necessárias {samples_per_class}. "
+                f"Verifique: {dataset.root_dir / class_name}"
             )
 
         selected_indices.extend(
@@ -113,34 +130,23 @@ def create_balanced_subset(dataset, total_samples, seed=SEED):
     return Subset(dataset, selected_indices)
 
 
+# ============================================================
+# 3. ARQUITETURA CAPSULE NETWORK
+# ============================================================
+
 def squash(vectors, dim=-1):
-    """
-    Reduz o comprimento do vetor para o intervalo [0, 1).
-
-    A direção do vetor é preservada.
-    """
-    squared_norm = (vectors ** 2).sum(
-        dim=dim, keepdim=True
-    )
-
+    """Reduz o comprimento do vetor para [0, 1), preservando a direção."""
+    squared_norm = (vectors ** 2).sum(dim=dim, keepdim=True)
     scale = (
         squared_norm / (1.0 + squared_norm)
     ) / torch.sqrt(squared_norm + 1e-8)
-
     return scale * vectors
 
 
 class PrimaryCapsules(nn.Module):
-    def __init__(
-        self,
-        in_channels=256,
-        capsule_channels=32,
-        capsule_dim=8
-    ):
+    def __init__(self, in_channels=256, capsule_channels=32, capsule_dim=8):
         super().__init__()
-
         self.capsule_dim = capsule_dim
-
         self.conv = nn.Conv2d(
             in_channels,
             capsule_channels * capsule_dim,
@@ -150,16 +156,8 @@ class PrimaryCapsules(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-
-        # [B, 256, 6, 6] -> [B, 1152, 8]
         batch_size = x.size(0)
-
-        x = x.view(
-            batch_size,
-            self.capsule_dim,
-            -1
-        ).transpose(1, 2)
-
+        x = x.view(batch_size, self.capsule_dim, -1).transpose(1, 2)
         return squash(x)
 
 
@@ -173,12 +171,8 @@ class DigitCapsules(nn.Module):
         routing_iterations=3
     ):
         super().__init__()
-
         self.num_classes = num_classes
         self.routing_iterations = routing_iterations
-
-        # Matriz de transformação de cada cápsula
-        # de entrada para cada classe.
         self.W = nn.Parameter(
             0.01 * torch.randn(
                 1,
@@ -192,18 +186,13 @@ class DigitCapsules(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
 
-        # Previsões das cápsulas de entrada.
         u_hat = torch.matmul(
             self.W,
             x[:, :, None, :, None]
         ).squeeze(-1)
 
-        # [B, cápsulas de entrada, classes, dimensão]
-        u_hat = u_hat.expand(
-            batch_size, -1, -1, -1
-        )
+        u_hat = u_hat.expand(batch_size, -1, -1, -1)
 
-        # Logits de roteamento.
         b = torch.zeros(
             batch_size,
             u_hat.size(1),
@@ -212,26 +201,13 @@ class DigitCapsules(nn.Module):
             dtype=x.dtype
         )
 
-        for iteration in range(
-            self.routing_iterations
-        ):
-            # Pesos de conexão entre cápsulas.
+        for iteration in range(self.routing_iterations):
             coupling = F.softmax(b, dim=2)
-
-            # Combina as previsões para cada classe.
-            s = (
-                coupling.unsqueeze(-1) * u_hat
-            ).sum(dim=1)
-
-            # Vetores das cápsulas de classe.
+            s = (coupling.unsqueeze(-1) * u_hat).sum(dim=1)
             v = squash(s)
 
             if iteration < self.routing_iterations - 1:
-                # Reforça as previsões concordantes.
-                agreement = (
-                    u_hat * v.unsqueeze(1)
-                ).sum(dim=-1)
-
+                agreement = (u_hat * v.unsqueeze(1)).sum(dim=-1)
                 b = b + agreement
 
         return v
@@ -240,63 +216,40 @@ class DigitCapsules(nn.Module):
 class CapsuleNetwork(nn.Module):
     def __init__(self):
         super().__init__()
-
         self.feature_extractor = nn.Sequential(
-            nn.Conv2d(
-                1, 256,
-                kernel_size=9,
-                stride=1
-            ),
+            nn.Conv2d(1, 256, kernel_size=9, stride=1),
             nn.ReLU()
         )
-
         self.primary_capsules = PrimaryCapsules()
-
         self.class_capsules = DigitCapsules()
 
     def forward(self, x):
         x = self.feature_extractor(x)
         x = self.primary_capsules(x)
         x = self.class_capsules(x)
-
-        # O comprimento de cada vetor representa
-        # a evidência para uma classe.
         return torch.norm(x, dim=-1)
 
 
 def capsule_margin_loss(
     scores,
     labels,
-    num_classes=3,
+    num_classes=NUM_CLASSES,
     m_plus=0.9,
     m_minus=0.1,
     lambda_=0.5
 ):
-    """
-    Incentiva a cápsula da classe correta a ter
-    comprimento elevado e as demais, comprimento baixo.
-    """
-    targets = F.one_hot(
-        labels, num_classes=num_classes
-    ).float()
+    targets = F.one_hot(labels, num_classes=num_classes).float()
+    positive_loss = targets * F.relu(m_plus - scores).pow(2)
+    negative_loss = (1 - targets) * F.relu(scores - m_minus).pow(2)
+    return (positive_loss + lambda_ * negative_loss).sum(dim=1).mean()
 
-    positive_loss = targets * F.relu(
-        m_plus - scores
-    ).pow(2)
 
-    negative_loss = (
-        (1 - targets)
-        * F.relu(scores - m_minus).pow(2)
-    )
-
-    loss = positive_loss + lambda_ * negative_loss
-
-    return loss.sum(dim=1).mean()
-
+# ============================================================
+# 4. AVALIAÇÃO, CHECKPOINT E PREDIÇÃO
+# ============================================================
 
 def evaluate(model, loader):
     model.eval()
-
     correct = 0
     total = 0
     total_loss = 0.0
@@ -305,46 +258,54 @@ def evaluate(model, loader):
         for images, labels in loader:
             images = images.to(device)
             labels = labels.to(device)
-
             scores = model(images)
-
-            loss = capsule_margin_loss(
-                scores, labels
-            )
+            loss = capsule_margin_loss(scores, labels)
 
             predictions = scores.argmax(dim=1)
-
-            correct += (
-                predictions == labels
-            ).sum().item()
-
+            correct += (predictions == labels).sum().item()
             total += labels.size(0)
             total_loss += loss.item() * labels.size(0)
 
-    accuracy = 100.0 * correct / total
-    average_loss = total_loss / total
+    if total == 0:
+        raise ValueError("O carregador de avaliação está vazio.")
 
-    return average_loss, accuracy
+    return total_loss / total, 100.0 * correct / total
+
+
+def save_checkpoint(model, optimizer, epoch, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "seed": SEED,
+            "class_to_label": CLASS_TO_LABEL,
+            "image_size": IMAGE_SIZE,
+        },
+        path
+    )
 
 
 def organize_test_predictions(model, dataset, loader, output_dir):
-    output_dir = Path(output_dir) / datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(output_dir) / timestamp
+
     label_to_folder = {
         label: class_name
         for class_name, label in dataset.CLASS_TO_LABEL.items()
     }
-
     for class_name in label_to_folder.values():
         (output_dir / class_name).mkdir(parents=True, exist_ok=True)
 
+    # loader.dataset pode ser um Subset; usamos seus índices para
+    # localizar corretamente os arquivos originais.
+    if isinstance(loader.dataset, Subset):
+        sample_indices = loader.dataset.indices
+    else:
+        sample_indices = list(range(len(dataset)))
+
     counts = {class_name: 0 for class_name in label_to_folder.values()}
-    sample_indices = getattr(
-        loader.dataset,
-        "indices",
-        range(len(dataset))
-    )
     sample_index = 0
     model.eval()
 
@@ -354,9 +315,7 @@ def organize_test_predictions(model, dataset, loader, output_dir):
             predictions = scores.argmax(dim=1).cpu().tolist()
 
             for predicted_label in predictions:
-                source_path, _ = dataset.samples[
-                    sample_indices[sample_index]
-                ]
+                source_path, _ = dataset.samples[sample_indices[sample_index]]
                 class_name = label_to_folder[predicted_label]
                 shutil.copy2(
                     source_path,
@@ -365,81 +324,180 @@ def organize_test_predictions(model, dataset, loader, output_dir):
                 counts[class_name] += 1
                 sample_index += 1
 
-    print(f"\nImagens classificadas copiadas para: {output_dir}")
-    print("-" * 40)
+    print(f"\nPrevisões copiadas para: {output_dir}")
     for class_name, count in counts.items():
-        print(f"{CLASS_NAMES[dataset.CLASS_TO_LABEL[class_name]]}: {count}")
+        print(f"{class_name}: {count}")
 
+    return output_dir
+
+
+def predict(model, image, true_label=None):
+    """Recebe uma imagem no formato [1, 28, 28]."""
+    model.eval()
+
+    with torch.no_grad():
+        image = image.unsqueeze(0).to(device)
+        scores = model(image)
+        probabilities = F.softmax(scores, dim=1)
+        predicted_class = scores.argmax(dim=1).item()
+
+    print("\nResultado da classificação")
+    print("-" * 40)
+    print(f"Classe prevista: {CLASS_NAMES[predicted_class]}")
+    print(f"Pontuações das cápsulas: {scores[0].cpu().numpy().round(3)}")
+    print(
+        "Softmax (referência; não é necessariamente uma probabilidade "
+        "calibrada):",
+        probabilities[0].cpu().numpy().round(3)
+    )
+
+    if true_label is not None:
+        print(f"Classe real: {CLASS_NAMES[int(true_label)]}")
+
+    return predicted_class
+
+
+# ============================================================
+# 5. TESTE DE DIAGNÓSTICO
+# ============================================================
+
+def diagnostic_test(model, train_loader):
+    print("\nTeste de diagnóstico: carregamento, forward e backward")
+    print("-" * 50)
+
+    start = __import__("time").time()
+    images, labels = next(iter(train_loader))
+    print(
+        f"Lote carregado em {__import__('time').time() - start:.2f}s",
+        images.shape,
+        labels.shape
+    )
+
+    model.train()
+    model.zero_grad(set_to_none=True)
+    images = images.to(device)
+    labels = labels.to(device)
+
+    start = __import__("time").time()
+    scores = model(images)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    print(
+        f"Forward concluído em {__import__('time').time() - start:.2f}s",
+        scores.shape
+    )
+
+    loss = capsule_margin_loss(scores, labels)
+    if not torch.isfinite(loss):
+        raise RuntimeError(f"Loss não finita: {loss.item()}")
+
+    start = __import__("time").time()
+    loss.backward()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    has_gradients = any(
+        parameter.grad is not None
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    print(
+        f"Backward concluído em {__import__('time').time() - start:.2f}s"
+    )
+    print(f"Loss: {loss.item():.4f}")
+    print(f"Gradientes calculados: {has_gradients}")
+
+    model.zero_grad(set_to_none=True)
+    if not has_gradients:
+        raise RuntimeError("Nenhum gradiente foi calculado.")
+
+    print("Diagnóstico concluído.")
+
+
+# ============================================================
+# 6. TREINAMENTO COMPLETO
+# ============================================================
 
 def train():
     if not TRAIN_DIR.is_dir() or not TEST_DIR.is_dir():
         raise FileNotFoundError(
             "Não encontrei as pastas train/test no Google Drive. "
-            "Monte o Drive no Colab e confira DATASET_DIR."
+            "Monte o Drive e confira DATASET_DIR."
         )
 
     train_dataset = GeometricShapesDataset(TRAIN_DIR)
-    test_dataset = GeometricShapesDataset(TEST_DIR)
+    full_test_dataset = GeometricShapesDataset(TEST_DIR)
+
+    # O teste usa 300 imagens balanceadas: 100 por classe.
     test_subset = create_balanced_subset(
-        test_dataset,
-        TEST_IMAGES
+        full_test_dataset,
+        TEST_IMAGES,
+        seed=SEED
     )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == "cuda")
     )
-
     test_loader = DataLoader(
         test_subset,
         batch_size=BATCH_SIZE,
-        shuffle=False
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(device.type == "cuda")
     )
 
+    print(f"Imagens de treinamento: {len(train_dataset)}")
+    print(f"Imagens de teste selecionadas: {len(test_subset)}")
+    print(f"Lotes de treino: {len(train_loader)}")
+    print(f"Lotes de teste: {len(test_loader)}")
+    print("-" * 50)
+
     model = CapsuleNetwork().to(device)
+
+    # Executa o teste antes de iniciar as épocas.
+    diagnostic_test(model, train_loader)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=LEARNING_RATE
     )
 
-    print(f"Imagens de treinamento: {len(train_dataset)}")
-    print("-" * 40)
-    print(f"Imagens de teste: {len(test_subset)}")
-    print("-" * 40)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = CHECKPOINT_DIR / "capsule_network_latest.pth"
+    best_accuracy = -1.0
 
     for epoch in range(EPOCHS):
         model.train()
-
         total_loss = 0.0
+        total_samples = 0
 
-        for images, labels in train_loader:
+        for batch_index, (images, labels) in enumerate(train_loader, start=1):
             images = images.to(device)
             labels = labels.to(device)
 
-            optimizer.zero_grad()
-
+            optimizer.zero_grad(set_to_none=True)
             scores = model(images)
+            loss = capsule_margin_loss(scores, labels)
 
-            loss = capsule_margin_loss(
-                scores, labels
-            )
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Loss não finita na época {epoch + 1}, "
+                    f"lote {batch_index}: {loss.item()}"
+                )
 
             loss.backward()
             optimizer.step()
 
-            total_loss += (
-                loss.item() * labels.size(0)
-            )
+            batch_size = labels.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
 
-        train_loss = (
-            total_loss / len(train_dataset)
-        )
-
-        test_loss, test_accuracy = evaluate(
-            model, test_loader
-        )
+        train_loss = total_loss / total_samples
+        test_loss, test_accuracy = evaluate(model, test_loader)
 
         print(
             f"Época {epoch + 1:02d}/{EPOCHS} | "
@@ -447,59 +505,44 @@ def train():
             f"Loss teste: {test_loss:.4f} | "
             f"Acurácia teste: {test_accuracy:.2f}%"
         )
-        print("-" * 40)
+
+        save_checkpoint(
+            model, optimizer, epoch + 1, checkpoint_path
+        )
+
+        if test_accuracy > best_accuracy:
+            best_accuracy = test_accuracy
+            best_path = CHECKPOINT_DIR / "capsule_network_best.pth"
+            save_checkpoint(
+                model, optimizer, epoch + 1, best_path
+            )
+
+    print("-" * 50)
+    print(f"Último checkpoint salvo em: {checkpoint_path}")
+    print(f"Melhor acurácia de teste: {best_accuracy:.2f}%")
+
     organize_test_predictions(
         model,
-        test_dataset,
+        full_test_dataset,
         test_loader,
-        DATASET_DIR / "resultados_teste"
+        RESULTS_DIR
     )
 
-    return model, test_loader
+    # Retorna também o dataset completo de teste, útil para inspeção.
+    return model, test_loader, full_test_dataset
 
 
-def predict(model, image, true_label=None):
-    model.eval()
-
-    with torch.no_grad():
-        image = image.unsqueeze(0).to(device)
-
-        scores = model(image)
-        probabilities = F.softmax(scores, dim=1)
-
-        predicted_class = scores.argmax(dim=1).item()
-
-    print("\nResultado da classificação")
-    print("-" * 40)
-    print(f"Classe prevista: {CLASS_NAMES[predicted_class]}")
-    print("-" * 40)
-    print(
-        f"Pontuações das cápsulas: "
-        f"{scores[0].cpu().numpy().round(3)}"
-    )
-    print("-" * 40)
-    print(
-        f"Softmax (referência): "
-        f"{probabilities[0].cpu().numpy().round(3)}"
-    )
-    print("-" * 40)
-
-    if true_label is not None:
-        print(f"Classe real: {CLASS_NAMES[true_label]}")
-        print("-" * 40)
-
-    return predicted_class
-
+# ============================================================
+# 7. EXECUÇÃO
+# ============================================================
 
 if __name__ == "__main__":
-    model, test_loader = train()
+    model, test_loader, test_dataset = train()
 
     rng = random.Random(SEED + 1)
     sample_index = rng.randrange(len(test_loader.dataset))
     image, label = test_loader.dataset[sample_index]
 
-    predict(
-        model,
-        image[0],
-        true_label=label[0].item()
-    )
+    print("\nPredição de uma imagem do conjunto de teste")
+    print("-" * 50)
+    predict(model, image, true_label=label.item())
